@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 import feedparser
 import requests
 
-from common import QuotaEsgotada, gemini_json, norm, notion_create, notion_query, rich, tg_text, txt
+from common import GeminiAturat, gemini_json, norm, notion_create, notion_query, rich, tg_text, txt
 from config import ESTATALS, FEEDS, MITJANS, MUNICIPIS, TEMES
 
 ARA = datetime.now(timezone.utc)
@@ -87,13 +87,13 @@ def main():
         print(f"[{i}/{len(noves)}] {n['titol'][:80]}")
         try:
             ia = gemini_json(PROMPT.format(mun=MUNICIPIS, tem=TEMES, **n))
-        except QuotaEsgotada as e:
-            print("Gemini sense quota, plego:", e)
-            tg_text(f"⚠️ Captura: Gemini sense quota. Analitzades {i - 1}/{len(noves)}, creades {creades}.")
+        except GeminiAturat as e:
+            print("Gemini aturat, plego:", e)
+            tg_text(f"⚠️ Captura: Gemini no respon ({str(e)[:150]}). Analitzades {i - 1}/{len(noves)}, creades {creades}.")
             break
         except Exception as e:
-            print("IA fallada:", e)
-            ia = {"relevante": True, "puntuacio": 1, "resum": "(La IA no ha respost)"}
+            print("IA fallada, la salto:", e)  # no creem fitxes buides a Notion
+            continue
         time.sleep(PAUSA_IA)  # límit gratuït de Gemini (també quan la notícia es descarta)
         punts = int(ia.get("puntuacio") or 0)
         if ia.get("relevante") is False or punts == 0:
