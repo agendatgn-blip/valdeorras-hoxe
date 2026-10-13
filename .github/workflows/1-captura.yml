@@ -1,15 +1,13 @@
-name: 3 · Produción de posts
+name: 1 · Captura de noticias
 on:
   schedule:
-    - cron: "*/15 6-21 * * *"
+    - cron: "0 5,12,18 * * *"
   workflow_dispatch:
-concurrency: produccio
-permissions:
-  contents: write
+concurrency: captura
 jobs:
-  produccio:
+  captura:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     env:
       NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -23,10 +21,4 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
-      - run: mkdir -p images && python produccio.py
-      - name: Garda as imaxes no repositorio
-        run: |
-          git config user.name "valdeorras-hoxe-bot"
-          git config user.email "bot@users.noreply.github.com"
-          git add images/
-          git diff --cached --quiet || (git commit -m "Novas imaxes" && git push)
+      - run: python captura.py
