@@ -71,7 +71,7 @@ def gemini_json(prompt, tries=4):
     body = {"contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"responseMimeType": "application/json", "temperature": 0.3}}
     for i in range(tries):
-        r = requests.post(url, params={"key": os.environ["GEMINI_API_KEY"]}, json=body, timeout=60)
+        r = requests.post(url, headers={"x-goog-api-key": os.environ["GEMINI_API_KEY"]}, json=body, timeout=60)
         if r.status_code == 429 or r.status_code >= 500:
             time.sleep(20 * (i + 1))
             continue
