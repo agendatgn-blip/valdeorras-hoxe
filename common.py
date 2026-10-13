@@ -1,120 +1,139 @@
-"""Workflow 1 · Captura: llegeix els feeds, la IA puntua i crea les notícies noves a Notion."""
+"""Connexions compartides: Notion, Gemini i Telegram."""
+import json
+import os
 import re
 import time
-from datetime import datetime, timedelta, timezone
 
-import feedparser
 import requests
 
-from common import QuotaEsgotada, gemini_json, norm, notion_create, notion_query, rich, tg_text, txt
-from config import ESTATALS, FEEDS, MITJANS, MUNICIPIS, TEMES
+from config import GEMINI_MODEL_DEFAULT, NOTION_DB
 
-ARA = datetime.now(timezone.utc)
-INICI = time.time()
-MAX_NOTICIES = 20      # màxim de notícies que passen per la IA a cada execució
-PAUSA_IA = 7           # segons entre crides a Gemini (límit gratuït ~10/min)
-TEMPS_MAX = 12 * 60    # si passem de 12 min, plegar (el workflow talla als 15)
-
-PROMPT = """Eres el editor de Valdeorras Hoxe, un medio de noticias locales de la comarca de Valdeorras (Ourense, Galicia).
-Analiza esta noticia y responde SOLO con un JSON con estas claves:
-- relevante: true si trata de la comarca de Valdeorras (O Barco, A Rúa, O Bolo, Carballeda, Larouco, Petín, Rubiá, A Veiga, Vilamartín) o de sus vecinos; si no, false.
-- municipi: uno de {mun}
-- tema: uno de {tem}
-- resum: dos frases en catalán, reescritas, sin copiar.
-- puntuacio: entero 0-5 según el interés para Instagram de la gente de Valdeorras (0 si no es relevante). Sube si es útil, cercana, emotiva o si la publica un diario estatal.
-
-MEDIO: {mitja}
-TITULAR: {titol}
-TEXTO: {extracte}"""
+NOTION_H = {
+    "Authorization": f"Bearer {os.environ.get('NOTION_TOKEN', '')}",
+    "Notion-Version": "2022-06-28",
+    "Content-Type": "application/json",
+}
 
 
-def mitja_de(font, link):
-    pista = f"{font} {link}".lower()
-    for k, v in MITJANS:
-        if k in pista:
-            return v
-    if any(e in font.lower() for e in ESTATALS):
-        return "Estatal"
-    return "Altres"
+# ---------- Notion ----------
+def notion_query(body):
+    out, cursor = [], None
+    while True:
+        b = dict(body)
+        if cursor:
+            b["start_cursor"] = cursor
+        r = requests.post(f"https://api.notion.com/v1/databases/{NOTION_DB}/query",
+                          headers=NOTION_H, json=b, timeout=30)
+        r.raise_for_status()
+        d = r.json()
+        out += d["results"]
+        if not d.get("has_more") or b.get("page_size", 100) < 100:
+            return out
+        cursor = d["next_cursor"]
 
 
-def main():
-    recents = notion_query({"page_size": 100, "filter": {"timestamp": "created_time", "created_time": {
-        "on_or_after": (ARA - timedelta(days=3)).isoformat()}}})
-    ja_links = {txt(p, "Enllaç") for p in recents}
-    ja_titols = {norm(txt(p, "Títol")) for p in recents}
+def notion_create(props):
+    r = requests.post("https://api.notion.com/v1/pages", headers=NOTION_H,
+                      json={"parent": {"database_id": NOTION_DB}, "properties": props}, timeout=30)
+    r.raise_for_status()
+    time.sleep(0.4)
 
-    noves, vistos = [], set()
-    for url in FEEDS:
-        try:
-            raw = requests.get(url, timeout=25, headers={"User-Agent": "Mozilla/5.0 (ValdeorrasHoxe bot)"}).content
-            feed = feedparser.parse(raw)
-        except Exception as e:
-            print("Feed fallat:", url, e)
+
+def notion_update(page_id, props):
+    r = requests.patch(f"https://api.notion.com/v1/pages/{page_id}", headers=NOTION_H,
+                       json={"properties": props}, timeout=30)
+    r.raise_for_status()
+
+
+def txt(page, name):
+    p = page["properties"].get(name, {})
+    t = p.get("type")
+    if t in ("title", "rich_text"):
+        return "".join(x["plain_text"] for x in p[t])
+    if t == "select":
+        return (p["select"] or {}).get("name", "")
+    if t == "url":
+        return p["url"] or ""
+    if t == "number":
+        return p["number"]
+    return ""
+
+
+def rich(s):
+    s = str(s or "")
+    return {"rich_text": [{"text": {"content": s[i:i + 1900]}} for i in range(0, min(len(s), 5700), 1900)]}
+
+
+# ---------- Gemini ----------
+class QuotaEsgotada(Exception):
+    """Gemini ha dit prou (429): no té sentit seguir provant en aquesta execució."""
+
+
+def gemini_json(prompt, tries=3):
+    model = os.environ.get("GEMINI_MODEL") or GEMINI_MODEL_DEFAULT
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    body = {"contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.3}}
+    for i in range(tries):
+        r = requests.post(url, headers={"x-goog-api-key": os.environ["GEMINI_API_KEY"]}, json=body, timeout=60)
+        if r.status_code == 429:
+            # Límit diari esgotat -> plegar ja. Límit per minut -> esperar 1 cop i reintentar.
+            if "PerDay" in r.text or i > 0:
+                raise QuotaEsgotada(r.text[:300])
+            print("Gemini 429 (límit per minut), espero 30 s...")
+            time.sleep(30)
             continue
-        for e in feed.entries:
-            titol, link = (e.get("title") or "").strip(), e.get("link") or ""
-            if not titol or not link:
-                continue
-            font = ""
-            if "news.google.com" in link:
-                font = (e.get("source") or {}).get("title", "")
-                m = re.match(r"^(.*) - ([^-]+)$", titol)
-                if m:
-                    titol, font = m.group(1).strip(), font or m.group(2).strip()
-            t = e.get("published_parsed") or e.get("updated_parsed")
-            data = datetime(*t[:6], tzinfo=timezone.utc) if t else ARA
-            if ARA - data > timedelta(hours=24):
-                continue
-            clau = norm(titol)
-            if clau in vistos or clau in ja_titols or link in ja_links:
-                continue
-            vistos.add(clau)
-            extracte = re.sub(r"<[^>]+>", " ", e.get("summary", ""))[:600]
-            noves.append(dict(titol=titol, link=link, mitja=mitja_de(font, link), data=data, extracte=extracte))
-    print(f"{len(noves)} notícies noves per analitzar")
-
-    noves.sort(key=lambda n: n["data"], reverse=True)  # primer les més recents
-    if len(noves) > MAX_NOTICIES:
-        print(f"Només analitzo les {MAX_NOTICIES} més recents")
-        noves = noves[:MAX_NOTICIES]
-
-    creades = 0
-    for i, n in enumerate(noves, 1):
-        if time.time() - INICI > TEMPS_MAX:
-            print("Temps màxim superat, plego. La resta, a la pròxima execució.")
-            break
-        print(f"[{i}/{len(noves)}] {n['titol'][:80]}")
-        try:
-            ia = gemini_json(PROMPT.format(mun=MUNICIPIS, tem=TEMES, **n))
-        except QuotaEsgotada as e:
-            print("Gemini sense quota, plego:", e)
-            tg_text(f"⚠️ Captura: Gemini sense quota. Analitzades {i - 1}/{len(noves)}, creades {creades}.")
-            break
-        except Exception as e:
-            print("IA fallada:", e)
-            ia = {"relevante": True, "puntuacio": 1, "resum": "(La IA no ha respost)"}
-        time.sleep(PAUSA_IA)  # límit gratuït de Gemini (també quan la notícia es descarta)
-        punts = int(ia.get("puntuacio") or 0)
-        if ia.get("relevante") is False or punts == 0:
+        if r.status_code >= 500:
+            print(f"Gemini {r.status_code}, reintento...")
+            time.sleep(10)
             continue
-        props = {
-            "Títol": {"title": [{"text": {"content": n["titol"][:200]}}]},
-            "Enllaç": {"url": n["link"]},
-            "Mitjà": {"select": {"name": n["mitja"]}},
-            "Data": {"date": {"start": n["data"].isoformat()}},
-            "Resum": rich(ia.get("resum")),
-            "Puntuació": {"number": punts},
-            "Estat": {"select": {"name": "Nova"}},
-        }
-        if ia.get("municipi") in MUNICIPIS:
-            props["Municipi"] = {"select": {"name": ia["municipi"]}}
-        if ia.get("tema") in TEMES:
-            props["Tema"] = {"select": {"name": ia["tema"]}}
-        notion_create(props)
-        creades += 1
-    print(f"{creades} notícies creades a Notion")
+        r.raise_for_status()
+        text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        text = re.sub(r"```(json)?", "", text).strip()
+        return json.loads(text)
+    raise RuntimeError("Gemini no respon")
 
 
-if __name__ == "__main__":
-    main()
+# ---------- Telegram ----------
+def _tg(method, **kw):
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        print("(sense Telegram)", kw.get("data", {}).get("text", "")[:200])
+        return
+    r = requests.post(f"https://api.telegram.org/bot{token}/{method}", timeout=60, **kw)
+    if not r.ok:
+        print("Telegram error:", r.text)
+
+
+def tg_text(text):
+    _tg("sendMessage", data={"chat_id": os.environ.get("TELEGRAM_CHAT_ID"), "text": text,
+                             "disable_web_page_preview": True})
+
+
+def tg_photo(path, caption=""):
+    with open(path, "rb") as f:
+        _tg("sendPhoto", data={"chat_id": os.environ.get("TELEGRAM_CHAT_ID"), "caption": caption[:1000]},
+            files={"photo": f})
+
+
+# ---------- Utilitats ----------
+def norm(t):
+    import unicodedata
+    t = unicodedata.normalize("NFD", (t or "").lower())
+    t = "".join(c for c in t if unicodedata.category(c) != "Mn")
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", "", t)).strip()
+
+
+def article_text(url, max_chars=4000):
+    """Intenta treure el text de la notícia original (paràgrafs <p>)."""
+    if "news.google.com" in url:
+        return ""
+    try:
+        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0 (ValdeorrasHoxe bot)"})
+        html = r.text
+    except Exception:
+        return ""
+    ps = re.findall(r"<p[^>]*>(.*?)</p>", html, flags=re.S | re.I)
+    clean = [re.sub(r"<[^>]+>", "", p).strip() for p in ps]
+    clean = [re.sub(r"\s+", " ", p) for p in clean if len(p) > 60]
+    return " ".join(clean)[:max_chars]
