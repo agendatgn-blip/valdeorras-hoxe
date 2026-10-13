@@ -65,8 +65,12 @@ def rich(s):
 
 
 # ---------- Gemini ----------
-class QuotaEsgotada(Exception):
-    """Gemini ha dit prou (429): no té sentit seguir provant en aquesta execució."""
+class GeminiAturat(Exception):
+    """Gemini no pot respondre en aquesta execució (sense quota, model inexistent, clau dolenta...)."""
+
+
+class QuotaEsgotada(GeminiAturat):
+    """Gemini ha dit prou (429)."""
 
 
 def gemini_json(prompt, tries=3):
@@ -87,6 +91,8 @@ def gemini_json(prompt, tries=3):
             print(f"Gemini {r.status_code}, reintento...")
             time.sleep(10)
             continue
+        if r.status_code in (400, 401, 403, 404):
+            raise GeminiAturat(f"{r.status_code} amb el model '{model}': {r.text[:300]}")
         r.raise_for_status()
         text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
         text = re.sub(r"```(json)?", "", text).strip()
