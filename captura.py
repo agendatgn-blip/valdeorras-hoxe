@@ -6,10 +6,14 @@ from datetime import datetime, timedelta, timezone
 import feedparser
 import requests
 
-from common import gemini_json, norm, notion_create, notion_query, rich, txt
+from common import QuotaEsgotada, gemini_json, norm, notion_create, notion_query, rich, tg_text, txt
 from config import ESTATALS, FEEDS, MITJANS, MUNICIPIS, TEMES
 
 ARA = datetime.now(timezone.utc)
+INICI = time.time()
+MAX_NOTICIES = 20      # màxim de notícies que passen per la IA a cada execució
+PAUSA_IA = 7           # segons entre crides a Gemini (límit gratuït ~10/min)
+TEMPS_MAX = 12 * 60    # si passem de 12 min, plegar (el workflow talla als 15)
 
 PROMPT = """Eres el editor de Valdeorras Hoxe, un medio de noticias locales de la comarca de Valdeorras (Ourense, Galicia).
 Analiza esta noticia y responde SOLO con un JSON con estas claves:
@@ -70,13 +74,27 @@ def main():
             noves.append(dict(titol=titol, link=link, mitja=mitja_de(font, link), data=data, extracte=extracte))
     print(f"{len(noves)} notícies noves per analitzar")
 
+    noves.sort(key=lambda n: n["data"], reverse=True)  # primer les més recents
+    if len(noves) > MAX_NOTICIES:
+        print(f"Només analitzo les {MAX_NOTICIES} més recents")
+        noves = noves[:MAX_NOTICIES]
+
     creades = 0
-    for n in noves:
+    for i, n in enumerate(noves, 1):
+        if time.time() - INICI > TEMPS_MAX:
+            print("Temps màxim superat, plego. La resta, a la pròxima execució.")
+            break
+        print(f"[{i}/{len(noves)}] {n['titol'][:80]}")
         try:
             ia = gemini_json(PROMPT.format(mun=MUNICIPIS, tem=TEMES, **n))
+        except QuotaEsgotada as e:
+            print("Gemini sense quota, plego:", e)
+            tg_text(f"⚠️ Captura: Gemini sense quota. Analitzades {i - 1}/{len(noves)}, creades {creades}.")
+            break
         except Exception as e:
             print("IA fallada:", e)
             ia = {"relevante": True, "puntuacio": 1, "resum": "(La IA no ha respost)"}
+        time.sleep(PAUSA_IA)  # límit gratuït de Gemini (també quan la notícia es descarta)
         punts = int(ia.get("puntuacio") or 0)
         if ia.get("relevante") is False or punts == 0:
             continue
@@ -95,7 +113,6 @@ def main():
             props["Tema"] = {"select": {"name": ia["tema"]}}
         notion_create(props)
         creades += 1
-        time.sleep(7)  # límit gratuït de Gemini
     print(f"{creades} notícies creades a Notion")
 
 
